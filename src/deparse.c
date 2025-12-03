@@ -63,12 +63,14 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
 #if (PG_VERSION_NUM < 120000)
 #include "optimizer/var.h"
 #else
 #include "optimizer/optimizer.h"
 #endif
+#include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -348,9 +350,11 @@ foreign_expr_walker(Node *node,
 		case T_Var:
 			{
 				Var		   *var = (Var *) node;
+				bool		is_in_foreign_rel = false;
 				
 				ereport(DEBUG3,
-					(errmsg("tds_fdw: it is a var expression")
+					(errmsg("tds_fdw: it is a var expression (varno=%d, varattno=%d)", 
+							var->varno, var->varattno)
 					)); 
 
 				/*
@@ -360,10 +364,32 @@ foreign_expr_walker(Node *node,
 				 * Param's collation, ie it's not safe for it to have a
 				 * non-default collation.
 				 */
-				if (var->varno == glob_cxt->foreignrel->relid &&
-					var->varlevelsup == 0)
+				if (var->varlevelsup == 0)
 				{
-					/* Var belongs to foreign table */
+					/*
+					 * Check if the Var belongs to the foreign relation.
+					 * For base relations, check if varno matches relid.
+					 * For join relations, check if varno is in the relids set.
+					 */
+					if (var->varno == glob_cxt->foreignrel->relid)
+					{
+						is_in_foreign_rel = true;
+					}
+#if (PG_VERSION_NUM >= 90500)
+					else if (fpinfo != NULL && fpinfo->rel_type == TDS_REL_JOIN)
+					{
+						/* For join relations, check if Var is from any component relation */
+						if (bms_is_member(var->varno, glob_cxt->foreignrel->relids))
+						{
+							is_in_foreign_rel = true;
+						}
+					}
+#endif
+				}
+				
+				if (is_in_foreign_rel)
+				{
+					/* Var belongs to foreign table (or join component) */
 
 					/*
 					 * System columns other than ctid should not be sent to
@@ -1369,16 +1395,48 @@ static void
 deparseVar(Var *node, deparse_expr_cxt *context)
 {		
 	StringInfo	buf = context->buf;
+	bool		is_in_foreign_rel = false;
+#if (PG_VERSION_NUM >= 90500)
+	TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) context->foreignrel->fdw_private;
+#endif
 	
 	ereport(DEBUG2,
-		(errmsg("tds_fdw: deparsing a var")
+		(errmsg("tds_fdw: deparsing a var (varno=%d, varattno=%d)", node->varno, node->varattno)
 		));
 
-	if (node->varno == context->foreignrel->relid &&
-		node->varlevelsup == 0)
+	/* Check if Var belongs to foreign relation */
+	if (node->varlevelsup == 0)
 	{
-		/* Var belongs to foreign table */
-		deparseColumnRef(buf, node->varno, node->varattno, context->root);
+		if (node->varno == context->foreignrel->relid)
+		{
+			is_in_foreign_rel = true;
+		}
+#if (PG_VERSION_NUM >= 90500)
+		else if (fpinfo != NULL && fpinfo->rel_type == TDS_REL_JOIN)
+		{
+			/* For join relations, check if Var is from any component relation */
+			if (bms_is_member(node->varno, context->foreignrel->relids))
+			{
+				is_in_foreign_rel = true;
+			}
+		}
+#endif
+	}
+
+	if (is_in_foreign_rel)
+	{
+#if (PG_VERSION_NUM >= 90500)
+		/* For join relations, use alias-qualified column references */
+		if (fpinfo != NULL && fpinfo->rel_type == TDS_REL_JOIN)
+		{
+			deparseColumnRefForJoin(buf, node->varno, node->varattno, context->root);
+		}
+		else
+#endif
+		{
+			/* Var belongs to base foreign table */
+			deparseColumnRef(buf, node->varno, node->varattno, context->root);
+		}
 	}
 	else
 	{
@@ -2067,3 +2125,360 @@ appendOrderByClause(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
 	}
 	/*reset_transmission_modes(nestlevel);*/
 }
+
+/*
+ * =============================================================================
+ * JOIN PUSHDOWN SUPPORT FUNCTIONS (PostgreSQL 9.5+)
+ * =============================================================================
+ */
+#if (PG_VERSION_NUM >= 90500)
+
+/*
+ * build_tlist_to_deparse
+ *		Build a target list of Vars to be fetched from the remote server
+ *		for a join relation. This extracts all Vars from the join's target
+ *		expressions and creates a flat list suitable for deparsing.
+ *
+ * The returned list contains TargetEntry nodes with Var expressions that
+ * represent the columns we need to fetch from the remote server. These
+ * are the raw column references - any complex expressions will be evaluated
+ * locally after fetching.
+ */
+List *
+build_tlist_to_deparse(RelOptInfo *joinrel)
+{
+	List	   *tlist = NIL;
+	List	   *vars;
+	ListCell   *lc;
+	int			resno = 1;
+	
+	/*
+	 * Extract all Vars from the join relation's target expressions.
+	 * PVC_RECURSE_PLACEHOLDERS ensures we get Vars inside PlaceHolderVars.
+	 */
+	vars = pull_var_clause((Node *) joinrel->reltarget->exprs,
+						   PVC_RECURSE_PLACEHOLDERS);
+	
+	/*
+	 * Also need to extract Vars from any lateral references (if any).
+	 * And from any RestrictInfos that will be evaluated remotely.
+	 */
+	if (joinrel->fdw_private != NULL)
+	{
+		TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) joinrel->fdw_private;
+		List	   *clause_vars;
+		ListCell   *lc2;
+		
+		/* Extract Vars from join clauses (which are RestrictInfo nodes) */
+		foreach(lc2, fpinfo->joinclauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			
+			clause_vars = pull_var_clause((Node *) rinfo->clause,
+										  PVC_RECURSE_PLACEHOLDERS);
+			vars = list_concat_unique(vars, clause_vars);
+		}
+		
+		/* Extract Vars from remote conditions (which are RestrictInfo nodes) */
+		foreach(lc2, fpinfo->remote_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			
+			clause_vars = pull_var_clause((Node *) rinfo->clause,
+										  PVC_RECURSE_PLACEHOLDERS);
+			vars = list_concat_unique(vars, clause_vars);
+		}
+	}
+	
+	/*
+	 * Create TargetEntry for each unique Var.
+	 * We use list_concat_unique above to avoid duplicates.
+	 */
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+		TargetEntry *tle;
+		
+		/* Skip system columns */
+		if (var->varattno < 0)
+			continue;
+		
+		/* Create a target entry for this Var */
+		tle = makeTargetEntry((Expr *) copyObject(var),
+							  resno++,
+							  NULL,		/* no name needed */
+							  false);	/* not resjunk */
+		tlist = lappend(tlist, tle);
+	}
+	
+	return tlist;
+}
+
+/*
+ * deparseRelationForJoin
+ *		Deparse a relation reference in a FROM clause for JOIN operations.
+ *		Includes table alias for disambiguation.
+ */
+static void
+deparseRelationForJoin(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
+					   bool use_alias, Index *rtindex)
+{
+	TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) rel->fdw_private;
+	
+	if (fpinfo->rel_type == TDS_REL_JOIN)
+	{
+		/* Recursively deparse the join */
+		deparseFromExprForJoin(buf, root, rel, true, rtindex);
+	}
+	else
+	{
+		/* Base relation - deparse table reference */
+		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+		Relation	relation;
+		
+		*rtindex = rel->relid;
+		
+		#if PG_VERSION_NUM < 120000
+		relation = heap_open(rte->relid, NoLock);
+		#else
+		relation = table_open(rte->relid, NoLock);
+		#endif
+		
+		deparseRelation(buf, relation);
+		
+		if (use_alias)
+		{
+			appendStringInfo(buf, " r%d", rel->relid);
+		}
+		
+		#if PG_VERSION_NUM < 120000
+		heap_close(relation, NoLock);
+		#else
+		table_close(relation, NoLock);
+		#endif
+	}
+}
+
+/*
+ * deparseFromExprForJoin
+ *		Deparse the FROM clause for a join relation.
+ *		Generates: outer_rel JOIN inner_rel ON join_conditions
+ */
+void
+deparseFromExprForJoin(StringInfo buf, PlannerInfo *root, RelOptInfo *joinrel,
+					   bool use_alias, Index *rtindex)
+{
+	TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) joinrel->fdw_private;
+	const char *join_keyword;
+	Index		outer_rtindex = 0;
+	Index		inner_rtindex = 0;
+	ListCell   *lc;
+	deparse_expr_cxt context;
+	bool		first;
+	
+	ereport(DEBUG3,
+		(errmsg("tds_fdw: deparseFromExprForJoin - jointype=%d", fpinfo->jointype)
+		));
+	
+	/* Determine the JOIN keyword based on join type */
+	switch (fpinfo->jointype)
+	{
+		case JOIN_INNER:
+			join_keyword = "INNER JOIN";
+			break;
+		case JOIN_LEFT:
+			join_keyword = "LEFT OUTER JOIN";
+			break;
+		case JOIN_RIGHT:
+			join_keyword = "RIGHT OUTER JOIN";
+			break;
+		case JOIN_FULL:
+			join_keyword = "FULL OUTER JOIN";
+			break;
+		default:
+			elog(ERROR, "tds_fdw: unsupported join type %d", fpinfo->jointype);
+			join_keyword = "";	/* keep compiler quiet */
+			break;
+	}
+	
+	/* Deparse outer relation */
+	appendStringInfoChar(buf, '(');
+	deparseRelationForJoin(buf, root, fpinfo->outerrel, use_alias, &outer_rtindex);
+	
+	/* Add JOIN keyword */
+	appendStringInfo(buf, " %s ", join_keyword);
+	
+	/* Deparse inner relation */
+	deparseRelationForJoin(buf, root, fpinfo->innerrel, use_alias, &inner_rtindex);
+	
+	/* Generate ON clause with join conditions */
+	if (fpinfo->joinclauses != NIL)
+	{
+		appendStringInfoString(buf, " ON ");
+		
+		/* Set up context for deparseExpr */
+		context.root = root;
+		context.foreignrel = joinrel;
+		context.buf = buf;
+		context.params_list = NULL;
+		
+		first = true;
+		foreach(lc, fpinfo->joinclauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			
+			/*
+			 * Skip constant TRUE expressions - these are sometimes added
+			 * by the planner but don't need to be in the ON clause.
+			 */
+			if (IsA(rinfo->clause, Const))
+			{
+				Const *con = (Const *) rinfo->clause;
+				if (con->consttype == BOOLOID && !con->constisnull && 
+					DatumGetBool(con->constvalue))
+				{
+					continue;	/* Skip TRUE constants */
+				}
+			}
+			
+			if (!first)
+				appendStringInfoString(buf, " AND ");
+			first = false;
+			
+			appendStringInfoChar(buf, '(');
+			deparseExpr(rinfo->clause, &context);
+			appendStringInfoChar(buf, ')');
+		}
+		
+		/* If all clauses were skipped (all TRUE), add 1=1 */
+		if (first)
+			appendStringInfoString(buf, "1=1");
+	}
+	else
+	{
+		/* No join conditions - use ON 1=1 */
+		appendStringInfoString(buf, " ON 1=1");
+	}
+	
+	appendStringInfoChar(buf, ')');
+	
+	if (rtindex)
+		*rtindex = outer_rtindex;
+}
+
+/*
+ * deparseSelectSqlForJoin
+ *		Construct a SELECT statement for a join relation.
+ *		tlist_to_deparse should be the result of build_tlist_to_deparse(),
+ *		containing only Var nodes that we need to fetch from the remote.
+ */
+void
+deparseSelectSqlForJoin(StringInfo buf, PlannerInfo *root, RelOptInfo *joinrel,
+						List *tlist_to_deparse, List **retrieved_attrs, TdsFdwOptionSet *option_set)
+{
+	TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) joinrel->fdw_private;
+	deparse_expr_cxt context;
+	ListCell   *lc;
+	bool		first;
+	int			attr_idx;
+	Index		rtindex = 0;
+	
+	ereport(DEBUG3,
+		(errmsg("tds_fdw: deparseSelectSqlForJoin with %d columns",
+				list_length(tlist_to_deparse))
+		));
+	
+	/* Set up context */
+	context.root = root;
+	context.foreignrel = joinrel;
+	context.buf = buf;
+	context.params_list = NULL;
+	
+	*retrieved_attrs = NIL;
+	
+	/* Build SELECT list from the Vars we need to fetch */
+	appendStringInfoString(buf, "SELECT ");
+	
+	first = true;
+	attr_idx = 1;
+	foreach(lc, tlist_to_deparse)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		
+		if (tle->resjunk)
+			continue;
+		
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+		
+		/* Deparse the Var - this will use table aliases for join queries */
+		deparseExpr((Expr *) tle->expr, &context);
+		
+		*retrieved_attrs = lappend_int(*retrieved_attrs, attr_idx);
+		attr_idx++;
+	}
+	
+	/* If no columns, select a constant */
+	if (first)
+	{
+		appendStringInfoString(buf, "NULL");
+	}
+	
+	/* Build FROM clause with JOIN */
+	appendStringInfoString(buf, " FROM ");
+	deparseFromExprForJoin(buf, root, joinrel, true, &rtindex);
+	
+	/* Add WHERE clause for remote conditions */
+	if (fpinfo->remote_conds != NIL)
+	{
+		appendWhereClause(buf, root, joinrel, fpinfo->remote_conds, true, NULL);
+	}
+}
+
+/*
+ * deparseColumnRefForJoin
+ *		Deparse a column reference with table alias for JOIN queries.
+ */
+void
+deparseColumnRefForJoin(StringInfo buf, int varno, int varattno, PlannerInfo *root)
+{
+	RangeTblEntry *rte;
+	char	   *colname = NULL;
+	List	   *options;
+	ListCell   *lc;
+
+	/* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
+	Assert(!IS_SPECIAL_VARNO(varno));
+
+	/* Get RangeTblEntry from array in PlannerInfo. */
+	rte = planner_rt_fetch(varno, root);
+
+	/*
+	 * If it's a column of a foreign table, and it has the column_name FDW
+	 * option, use that value.
+	 */
+	options = GetForeignColumnOptions(rte->relid, varattno);
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "column_name") == 0)
+		{
+			colname = defGetString(def);
+			break;
+		}
+	}
+
+	/*
+	 * If it's a column of a regular table or it doesn't have column_name FDW
+	 * option, use attribute name.
+	 */
+	if (colname == NULL)
+		colname = get_relid_attribute_name(rte->relid, varattno);
+
+	/* Add table alias prefix and column name */
+	appendStringInfo(buf, "r%d.%s", varno, tds_quote_identifier(colname));
+}
+
+#endif /* PG_VERSION_NUM >= 90500 */

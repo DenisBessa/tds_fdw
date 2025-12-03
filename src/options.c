@@ -63,6 +63,7 @@ static struct TdsFdwOption valid_options[] =
 	{ "use_remote_estimate",	ForeignServerRelationId },
 	{ "fdw_startup_cost", 		ForeignServerRelationId },
 	{ "fdw_tuple_cost", 		ForeignServerRelationId },
+	{ "enable_join_pushdown",	ForeignServerRelationId },
 	{ "username",				UserMappingRelationId },
 	{ "password",				UserMappingRelationId },
 	{ "query", 					ForeignTableRelationId },
@@ -523,6 +524,11 @@ void tdsGetForeignServerTableOptions(List *options_list, TdsFdwOptionSet *option
 					
 			option_set->use_remote_estimate = atoi(defGetString(def));	
 		}
+		
+		else if (strcmp(def->defname, "enable_join_pushdown") == 0)
+		{
+			option_set->enable_join_pushdown = defGetBoolean(def);
+		}
 	}
 	
 	#ifdef DEBUG
@@ -957,6 +963,7 @@ void tdsOptionSetInit(TdsFdwOptionSet* option_set)
 	option_set->fdw_startup_cost = 0;
 	option_set->fdw_tuple_cost = 0;
 	option_set->local_tuple_estimate = 0;
+	option_set->enable_join_pushdown = true;  /* Enable JOIN pushdown by default */
 	
 	#ifdef DEBUG
 		ereport(NOTICE,

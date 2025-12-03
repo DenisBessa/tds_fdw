@@ -36,6 +36,7 @@ typedef struct TdsFdwOptionSet
 	int fdw_startup_cost;
 	int fdw_tuple_cost;
 	int local_tuple_estimate;
+	bool enable_join_pushdown;	/* Enable JOIN pushdown to remote server */
 } TdsFdwOptionSet;
 
 void tdsValidateOptions(List *options_list, Oid context, TdsFdwOptionSet* option_set);

@@ -73,6 +73,8 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/planmain.h"
+#include "parser/parsetree.h"
+#include "nodes/makefuncs.h"
 
 /* DB-Library headers (e.g. FreeTDS */
 #include <sybfront.h>
@@ -149,7 +151,9 @@ enum FdwScanPrivateIndex
 	/* SQL statement to execute remotely (as a String node) */
 	FdwScanPrivateSelectSql,
 	/* Integer list of attribute numbers retrieved by the SELECT */
-	FdwScanPrivateRetrievedAttrs
+	FdwScanPrivateRetrievedAttrs,
+	/* Server OID for join relations (as an Integer node), 0 for base relations */
+	FdwScanPrivateServerId
 };
 
 PG_FUNCTION_INFO_V1(tds_fdw_handler);
@@ -170,7 +174,14 @@ PGDLLEXPORT Datum tds_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->GetForeignPaths = tdsGetForeignPaths;
 	fdwroutine->AnalyzeForeignTable = tdsAnalyzeForeignTable;
 	fdwroutine->GetForeignPlan = tdsGetForeignPlan;
-	#else
+	#endif
+
+	/* JOIN pushdown support - PostgreSQL 9.5+ */
+	#if (PG_VERSION_NUM >= 90500)
+	fdwroutine->GetForeignJoinPaths = tdsGetForeignJoinPaths;
+	#endif
+
+	#if (PG_VERSION_NUM < 90200)
 	fdwroutine->PlanForeignScan = tdsPlanForeignScan;
 	#endif
 	
@@ -1407,6 +1418,7 @@ void tdsBeginForeignScan(ForeignScanState *node, int eflags)
 	TdsFdwExecutionState *festate;
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	EState *estate = node->ss.ps.state;
+	Oid			serverid;
 	
 	#ifdef DEBUG
 		ereport(NOTICE,
@@ -1416,7 +1428,26 @@ void tdsBeginForeignScan(ForeignScanState *node, int eflags)
 	
 	tds_clear_signals();
 	
-	tdsGetForeignTableOptionsFromCatalog(RelationGetRelid(node->ss.ss_currentRelation), &option_set);
+	/*
+	 * Get the server OID from fdw_private. For join scans, this is the
+	 * server OID. For base relation scans, it's 0 and we get options
+	 * from the foreign table.
+	 */
+	serverid = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateServerId));
+	
+	if (serverid != InvalidOid && fsplan->scan.scanrelid == 0)
+	{
+		/* Join scan - get options from the server */
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: BeginForeignScan for JOIN relation, serverid=%u", serverid)
+			));
+		tdsGetForeignServerOptionsFromCatalog(serverid, &option_set);
+	}
+	else
+	{
+		/* Base relation scan - get options from the foreign table */
+		tdsGetForeignTableOptionsFromCatalog(RelationGetRelid(node->ss.ss_currentRelation), &option_set);
+	}
 		
 	ereport(DEBUG3,
 		(errmsg("tds_fdw: Initiating DB-Library")
@@ -1483,6 +1514,8 @@ void tdsBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->mem_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											   "tds_fdw data",
 											   ALLOCSET_DEFAULT_SIZES);
+	festate->is_join_scan = (serverid != InvalidOid && fsplan->scan.scanrelid == 0);
+	festate->serverid = serverid;
 	
 cleanup:
 	;
@@ -1494,18 +1527,36 @@ cleanup:
 	#endif
 }
 
-void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set)
+void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set, bool is_join_scan)
 {
  	MemoryContext old_cxt;
 	int ncol;
 	char* local_columns_found = NULL;
 	TdsFdwExecutionState *festate = (TdsFdwExecutionState *)node->fdw_state;
 	int num_retrieved_attrs = list_length(festate->retrieved_attrs);
-	Oid relOid = RelationGetRelid(node->ss.ss_currentRelation);
+	Oid relOid = InvalidOid;
+	TupleDesc tupdesc;
+	
+	/*
+	 * For join scans, ss_currentRelation is NULL, so we use the TupleDesc
+	 * from the scan slot which was configured from fdw_scan_tlist.
+	 * For base relations, we use the relation's tuple descriptor.
+	 */
+	if (is_join_scan)
+	{
+		tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+		/* For joins, we don't match by column names - use position */
+		option_set->match_column_names = 0;
+	}
+	else
+	{
+		relOid = RelationGetRelid(node->ss.ss_currentRelation);
+		tupdesc = node->ss.ss_currentRelation->rd_att;
+	}
 
 	old_cxt = MemoryContextSwitchTo(festate->mem_cxt);
 
-	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
+	festate->attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
 	if (option_set->match_column_names && festate->ncols < num_retrieved_attrs)
 	{
@@ -1784,14 +1835,27 @@ TupleTableSlot* tdsIterateForeignScan(ForeignScanState *node)
 
 			MemoryContextReset(festate->mem_cxt);
 			
-			relOid = RelationGetRelid(node->ss.ss_currentRelation);
+			/*
+			 * Get options and column metadata. For join scans, we get options
+			 * from the server; for base relation scans, from the foreign table.
+			 */
+			if (festate->is_join_scan)
+			{
+				ereport(DEBUG3,
+					(errmsg("tds_fdw: This is a JOIN scan, serverid=%u", festate->serverid)
+					));
+				tdsGetForeignServerOptionsFromCatalog(festate->serverid, &option_set);
+			}
+			else
+			{
+				relOid = RelationGetRelid(node->ss.ss_currentRelation);
+				ereport(DEBUG3,
+					(errmsg("tds_fdw: Table OID is %i", relOid)
+					));
+				tdsGetForeignTableOptionsFromCatalog(relOid, &option_set);
+			}
 			
-			ereport(DEBUG3,
-				(errmsg("tds_fdw: Table OID is %i", relOid)
-				));
-			
-			tdsGetForeignTableOptionsFromCatalog(relOid, &option_set);	
-			tdsGetColumnMetadata(node, &option_set);
+			tdsGetColumnMetadata(node, &option_set, festate->is_join_scan);
 
 			for (ncol = 0; ncol < festate->ncols; ncol++) {
 				COL* column = &festate->columns[ncol];
@@ -2008,7 +2072,14 @@ TupleTableSlot* tdsIterateForeignScan(ForeignScanState *node)
 					MemoryContextStats(estate->es_query_cxt);
 				}
 
-				tuple = heap_form_tuple(node->ss.ss_currentRelation->rd_att, festate->datums, festate->isnull);
+				/*
+				 * For join scans, use the TupleDesc from the scan slot.
+				 * For base relations, use the relation's TupleDesc.
+				 */
+				if (festate->is_join_scan)
+					tuple = heap_form_tuple(slot->tts_tupleDescriptor, festate->datums, festate->isnull);
+				else
+					tuple = heap_form_tuple(node->ss.ss_currentRelation->rd_att, festate->datums, festate->isnull);
 #if PG_VERSION_NUM < 120000
 				ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 #else
@@ -2415,9 +2486,17 @@ void tdsGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
 	fpinfo = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
 	baserel->fdw_private = (void *) fpinfo;
 
+	/* This is a base relation (single foreign table) */
+	fpinfo->rel_type = TDS_REL_BASE;
+
 	/* Look up foreign-table catalog info. */
 	fpinfo->table = GetForeignTable(foreigntableid);
 	fpinfo->server = GetForeignServer(fpinfo->table->serverid);
+	
+#if (PG_VERSION_NUM >= 90500)
+	/* Store server ID for join pushdown checks */
+	fpinfo->serverid = fpinfo->table->serverid;
+#endif
 	
 	tdsGetForeignTableOptionsFromCatalog(foreigntableid, &option_set);
 	
@@ -2969,6 +3048,475 @@ void tdsGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntable
 	#endif
 }
 
+/*
+ * JOIN pushdown support functions (PostgreSQL 9.5+)
+ */
+#if (PG_VERSION_NUM >= 90500)
+
+/*
+ * tdsGetForeignServerIdFromRelation
+ *		Get the server OID for a foreign relation.
+ *		For base relations, this comes from the foreign table catalog.
+ *		For join relations, it comes from the fpinfo structure.
+ */
+Oid
+tdsGetForeignServerIdFromRelation(PlannerInfo *root, RelOptInfo *rel)
+{
+	TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) rel->fdw_private;
+	
+	if (fpinfo == NULL)
+		return InvalidOid;
+	
+	if (fpinfo->rel_type == TDS_REL_JOIN)
+	{
+		/* For join relations, server ID is stored in fpinfo */
+		return fpinfo->serverid;
+	}
+	else
+	{
+		/* For base relations, get it from the foreign table */
+		if (fpinfo->server != NULL)
+			return fpinfo->server->serverid;
+		
+		/* Fall back to looking it up from catalog */
+		if (rel->relid > 0 && rel->relid < root->simple_rel_array_size)
+		{
+			RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+			if (rte && rte->rtekind == RTE_RELATION)
+			{
+				ForeignTable *table = GetForeignTable(rte->relid);
+				if (table)
+					return table->serverid;
+			}
+		}
+	}
+	
+	return InvalidOid;
+}
+
+/*
+ * tdsIsForeignRelation
+ *		Check if a relation is a foreign relation managed by tds_fdw.
+ */
+bool
+tdsIsForeignRelation(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	ForeignTable *table;
+	ForeignServer *server;
+	ForeignDataWrapper *fdw;
+	
+	/* 
+	 * For join relations, check if fdw_private is populated
+	 * (we only create join paths for TDS relations)
+	 */
+	if (rel->reloptkind == RELOPT_JOINREL)
+	{
+		TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) rel->fdw_private;
+		return (fpinfo != NULL && fpinfo->rel_type == TDS_REL_JOIN);
+	}
+	
+	/* For base relations, verify it's our FDW */
+	if (rel->relid == 0 || rel->relid >= root->simple_rel_array_size)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: tdsIsForeignRelation - relid out of range: %d", rel->relid)
+			));
+		return false;
+	}
+	
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: tdsIsForeignRelation - rte is NULL or not RTE_RELATION")
+			));
+		return false;
+	}
+	
+	/* Check if it's a foreign table */
+	if (rte->relkind != RELKIND_FOREIGN_TABLE)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: tdsIsForeignRelation - relkind is not FOREIGN_TABLE: %c", rte->relkind)
+			));
+		return false;
+	}
+	
+	/* Get foreign table info */
+	table = GetForeignTable(rte->relid);
+	if (table == NULL)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: tdsIsForeignRelation - GetForeignTable returned NULL")
+			));
+		return false;
+	}
+	
+	/* Get foreign server and FDW info */
+	server = GetForeignServer(table->serverid);
+	if (server == NULL)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: tdsIsForeignRelation - GetForeignServer returned NULL")
+			));
+		return false;
+	}
+	
+	fdw = GetForeignDataWrapper(server->fdwid);
+	if (fdw == NULL)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: tdsIsForeignRelation - GetForeignDataWrapper returned NULL")
+			));
+		return false;
+	}
+	
+	/* Check if it's our FDW by name */
+	ereport(DEBUG3,
+		(errmsg("tds_fdw: tdsIsForeignRelation - FDW name is: %s", fdw->fdwname)
+		));
+	return (strcmp(fdw->fdwname, "tds_fdw") == 0);
+}
+
+/*
+ * tdsGetForeignJoinRelSize
+ *		Estimate the size of a foreign join relation.
+ */
+void
+tdsGetForeignJoinRelSize(PlannerInfo *root, RelOptInfo *joinrel,
+						 RelOptInfo *outerrel, RelOptInfo *innerrel,
+						 JoinType jointype)
+{
+	TdsFdwRelationInfo *fpinfo;
+	TdsFdwRelationInfo *fpinfo_o;
+	TdsFdwRelationInfo *fpinfo_i;
+	double		nrows;
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> starting tdsGetForeignJoinRelSize")
+			));
+	#endif
+	
+	fpinfo = (TdsFdwRelationInfo *) joinrel->fdw_private;
+	fpinfo_o = (TdsFdwRelationInfo *) outerrel->fdw_private;
+	fpinfo_i = (TdsFdwRelationInfo *) innerrel->fdw_private;
+	
+	/*
+	 * Estimate join size. We use a simple heuristic based on the
+	 * sizes of the component relations. For a more accurate estimate,
+	 * you would use the remote server's EXPLAIN, but that requires
+	 * a connection which we want to avoid during planning.
+	 */
+	nrows = outerrel->rows * innerrel->rows;
+	
+	/* Apply selectivity from join conditions */
+	if (fpinfo->joinclauses != NIL)
+	{
+		Selectivity sel = clauselist_selectivity(root,
+												 fpinfo->joinclauses,
+												 0,
+												 jointype,
+												 NULL);
+		nrows *= sel;
+	}
+	
+	/* Clamp to reasonable bounds */
+	if (nrows < 1)
+		nrows = 1;
+	
+	fpinfo->rows = nrows;
+	joinrel->rows = nrows;
+	
+	/*
+	 * Estimate costs. JOIN pushdown should be cheaper than separate scans
+	 * because we only make one round-trip to the remote server instead of two.
+	 * Use a lower startup cost (only one connection) and reduce total cost.
+	 */
+	fpinfo->startup_cost = Max(fpinfo_o->startup_cost, fpinfo_i->startup_cost);
+	fpinfo->total_cost = fpinfo->startup_cost + cpu_tuple_cost * nrows;
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> finishing tdsGetForeignJoinRelSize")
+			));
+	#endif
+}
+
+/*
+ * tdsGetForeignJoinPaths
+ *		Create possible access paths for a join of two foreign tables.
+ *		This is the main entry point for JOIN pushdown.
+ */
+void
+tdsGetForeignJoinPaths(PlannerInfo *root,
+					   RelOptInfo *joinrel,
+					   RelOptInfo *outerrel,
+					   RelOptInfo *innerrel,
+					   JoinType jointype,
+					   JoinPathExtraData *extra)
+{
+	TdsFdwRelationInfo *fpinfo;
+	TdsFdwRelationInfo *fpinfo_o;
+	TdsFdwRelationInfo *fpinfo_i;
+	ForeignPath *joinpath;
+	Oid			serverid_o;
+	Oid			serverid_i;
+	List	   *joinclauses;
+	ListCell   *lc;
+	Cost		startup_cost;
+	Cost		total_cost;
+	double		rows;
+	
+	ereport(DEBUG3,
+		(errmsg("tds_fdw: tdsGetForeignJoinPaths called")
+		));
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> starting tdsGetForeignJoinPaths")
+			));
+	#endif
+	
+	/*
+	 * Skip if this join combination has already been considered.
+	 * This can happen when the same join is explored with different
+	 * parameter sets.
+	 */
+	if (joinrel->fdw_private != NULL)
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: Join relation already has fdw_private, skipping")
+			));
+		return;
+	}
+	
+	/*
+	 * Check that both relations are foreign tables from our FDW.
+	 */
+	ereport(DEBUG3,
+		(errmsg("tds_fdw: Checking if relations are foreign tables - outer relkind=%d, inner relkind=%d",
+				outerrel->reloptkind, innerrel->reloptkind)
+		));
+	
+	if (!tdsIsForeignRelation(root, outerrel) ||
+		!tdsIsForeignRelation(root, innerrel))
+	{
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: One or both relations are not TDS foreign tables (outer=%d, inner=%d)",
+					tdsIsForeignRelation(root, outerrel),
+					tdsIsForeignRelation(root, innerrel))
+			));
+		#ifdef DEBUG
+			ereport(NOTICE,
+				(errmsg("tds_fdw: One or both relations are not TDS foreign tables")
+				));
+		#endif
+		return;
+	}
+	
+	/*
+	 * Verify both tables are on the same server.
+	 * We can only push down joins between tables on the same server.
+	 */
+	serverid_o = tdsGetForeignServerIdFromRelation(root, outerrel);
+	serverid_i = tdsGetForeignServerIdFromRelation(root, innerrel);
+	
+	if (serverid_o == InvalidOid || serverid_i == InvalidOid ||
+		serverid_o != serverid_i)
+	{
+		#ifdef DEBUG
+			ereport(NOTICE,
+				(errmsg("tds_fdw: Tables are on different servers, cannot push down join")
+				));
+		#endif
+		return;
+	}
+	
+	/*
+	 * Check if JOIN pushdown is enabled for this server.
+	 * The enable_join_pushdown option can be set at server level.
+	 */
+	{
+		TdsFdwOptionSet option_set;
+		
+		tdsGetForeignServerOptionsFromCatalog(serverid_o, &option_set);
+		
+		if (!option_set.enable_join_pushdown)
+		{
+			ereport(DEBUG3,
+				(errmsg("tds_fdw: JOIN pushdown disabled for this server")
+				));
+			return;
+		}
+	}
+	
+	/*
+	 * We support INNER, LEFT, RIGHT, and FULL OUTER joins.
+	 * Other join types cannot be pushed down.
+	 */
+	switch (jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_RIGHT:
+		case JOIN_FULL:
+			/* Supported join types */
+			break;
+		default:
+			#ifdef DEBUG
+				ereport(NOTICE,
+					(errmsg("tds_fdw: Unsupported join type %d", (int) jointype)
+					));
+			#endif
+			return;
+	}
+	
+	/*
+	 * Get the fpinfo from the component relations.
+	 */
+	fpinfo_o = (TdsFdwRelationInfo *) outerrel->fdw_private;
+	fpinfo_i = (TdsFdwRelationInfo *) innerrel->fdw_private;
+	
+	if (fpinfo_o == NULL || fpinfo_i == NULL)
+	{
+		#ifdef DEBUG
+			ereport(NOTICE,
+				(errmsg("tds_fdw: Missing fdw_private in component relations")
+				));
+		#endif
+		return;
+	}
+	
+	/*
+	 * Extract join clauses that can be pushed down.
+	 * We need to check each clause to see if it's safe to evaluate remotely.
+	 */
+	joinclauses = NIL;
+	foreach(lc, extra->restrictlist)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		
+		/* 
+		 * For now, we'll add all clauses to the join.
+		 * The is_foreign_expr check will be done during deparsing.
+		 * A more sophisticated implementation would filter clauses here.
+		 */
+		joinclauses = lappend(joinclauses, rinfo);
+	}
+	
+	/*
+	 * Create fpinfo for the join relation.
+	 */
+	fpinfo = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
+	fpinfo->rel_type = TDS_REL_JOIN;
+	fpinfo->serverid = serverid_o;
+	fpinfo->outerrel = outerrel;
+	fpinfo->innerrel = innerrel;
+	fpinfo->jointype = jointype;
+	fpinfo->joinclauses = joinclauses;
+	fpinfo->lower_rels = bms_union(outerrel->relids, innerrel->relids);
+	
+	/* Copy cost parameters from outer relation */
+	fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate;
+	fpinfo->fdw_startup_cost = fpinfo_o->fdw_startup_cost;
+	fpinfo->fdw_tuple_cost = fpinfo_o->fdw_tuple_cost;
+	fpinfo->server = fpinfo_o->server;
+	fpinfo->user = fpinfo_o->user;
+	
+	/* Combine remote and local conditions from both relations */
+	fpinfo->remote_conds = list_concat(list_copy(fpinfo_o->remote_conds),
+									   list_copy(fpinfo_i->remote_conds));
+	fpinfo->local_conds = list_concat(list_copy(fpinfo_o->local_conds),
+									  list_copy(fpinfo_i->local_conds));
+	
+	/* Combine attrs_used from both relations */
+	fpinfo->attrs_used = bms_union(fpinfo_o->attrs_used, fpinfo_i->attrs_used);
+	
+	/* Store fpinfo in join relation */
+	joinrel->fdw_private = fpinfo;
+	
+	/*
+	 * Estimate the size of the join result.
+	 */
+	tdsGetForeignJoinRelSize(root, joinrel, outerrel, innerrel, jointype);
+	
+	/*
+	 * Get estimated costs.
+	 */
+	startup_cost = fpinfo->startup_cost;
+	total_cost = fpinfo->total_cost;
+	rows = fpinfo->rows;
+	
+	/*
+	 * Create a new join path.
+	 */
+#if PG_VERSION_NUM < 120000
+	joinpath = create_foreignscan_path(root,
+									   joinrel,
+									   rows,
+									   startup_cost,
+									   total_cost,
+									   NIL,		/* no pathkeys */
+									   NULL,	/* no required outer relids */
+									   NULL,	/* no fdw_outerpath */
+									   NIL);	/* no fdw_private */
+#elif PG_VERSION_NUM < 170000
+	joinpath = create_foreignscan_path(root,
+									   joinrel,
+									   NULL,	/* default pathtarget */
+									   rows,
+									   startup_cost,
+									   total_cost,
+									   NIL,		/* no pathkeys */
+									   joinrel->lateral_relids,
+									   NULL,	/* no fdw_outerpath */
+									   NIL);	/* no fdw_private */
+#elif PG_VERSION_NUM < 180000
+	joinpath = create_foreignscan_path(root,
+									   joinrel,
+									   NULL,	/* default pathtarget */
+									   rows,
+									   startup_cost,
+									   total_cost,
+									   NIL,		/* no pathkeys */
+									   joinrel->lateral_relids,
+									   NULL,	/* no fdw_outerpath */
+									   NIL,		/* no fdw_restrictinfo */
+									   NIL);	/* no fdw_private */
+#else
+	joinpath = create_foreignscan_path(root,
+									   joinrel,
+									   NULL,	/* default pathtarget */
+									   rows,
+									   0,		/* disabled nodes */
+									   startup_cost,
+									   total_cost,
+									   NIL,		/* no pathkeys */
+									   joinrel->lateral_relids,
+									   NULL,	/* no fdw_outerpath */
+									   NIL,		/* no fdw_restrictinfo */
+									   NIL);	/* no fdw_private */
+#endif
+	
+	/* Add the path to the join relation */
+	add_path(joinrel, (Path *) joinpath);
+	
+	ereport(DEBUG3,
+		(errmsg("tds_fdw: JOIN path added - rows=%.0f, startup_cost=%.2f, total_cost=%.2f",
+				rows, startup_cost, total_cost)
+		));
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> finishing tdsGetForeignJoinPaths (path added)")
+			));
+	#endif
+}
+
+#endif /* PG_VERSION_NUM >= 90500 */
+
 bool tdsAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func, BlockNumber *totalpages)
 {
 	#ifdef DEBUG
@@ -2995,7 +3543,7 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 {
 	TdsFdwRelationInfo *fpinfo = (TdsFdwRelationInfo *) baserel->fdw_private;
 	TdsFdwOptionSet option_set;
-	Index		scan_relid = baserel->relid;
+	Index		scan_relid;
 	List	   *fdw_private;
 	List	   *remote_conds = NIL;
 	List	   *remote_exprs = NIL;
@@ -3003,6 +3551,11 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *params_list = NIL;
 	List	   *retrieved_attrs = NIL;
 	ListCell   *lc;
+#if (PG_VERSION_NUM >= 90500)
+	StringInfoData sql;
+	bool		is_join_rel = false;
+	List	   *fdw_scan_tlist = NIL;
+#endif
 	
 	#ifdef DEBUG
 		ereport(NOTICE,
@@ -3010,68 +3563,157 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 			));
 	#endif
 	
-	tdsGetForeignTableOptionsFromCatalog(foreigntableid, &option_set);
+#if (PG_VERSION_NUM >= 90500)
+	/*
+	 * Check if this is a join relation.
+	 * For join relations, scan_relid must be 0 and we build a different query.
+	 */
+	is_join_rel = (fpinfo != NULL && fpinfo->rel_type == TDS_REL_JOIN);
 	
-	/*
-	 * Separate the scan_clauses into those that can be executed remotely and
-	 * those that can't.  baserestrictinfo clauses that were previously
-	 * determined to be safe or unsafe by classifyConditions are shown in
-	 * fpinfo->remote_conds and fpinfo->local_conds.  Anything else in the
-	 * scan_clauses list will be a join clause, which we have to check for
-	 * remote-safety.
-	 *
-	 * Note: the join clauses we see here should be the exact same ones
-	 * previously examined by postgresGetForeignPaths.  Possibly it'd be worth
-	 * passing forward the classification work done then, rather than
-	 * repeating it here.
-	 *
-	 * This code must match "extract_actual_clauses(scan_clauses, false)"
-	 * except for the additional decision about remote versus local execution.
-	 * Note however that we don't strip the RestrictInfo nodes from the
-	 * remote_conds list, since appendWhereClause expects a list of
-	 * RestrictInfos.
-	 */
-	foreach(lc, scan_clauses)
+	if (is_join_rel)
 	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
-		Assert(IsA(rinfo, RestrictInfo));
-
-		/* Ignore any pseudoconstants, they're dealt with elsewhere */
-		if (rinfo->pseudoconstant)
-			continue;
-
-		if (list_member_ptr(fpinfo->remote_conds, rinfo))
+		List	   *tlist_to_deparse;
+		
+		scan_relid = 0;
+		
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: Building plan for JOIN relation")
+			));
+		
+		/*
+		 * Get options from the server (using the stored server info).
+		 * For joins, we don't have a single foreign table ID.
+		 */
+		tdsGetForeignServerOptionsFromCatalog(fpinfo->serverid, &option_set);
+		
+		/*
+		 * For join relations, extract local conditions from scan_clauses.
+		 * Remote conditions were already classified during GetForeignJoinPaths.
+		 */
+		foreach(lc, scan_clauses)
 		{
-			remote_conds = lappend(remote_conds, rinfo);
-			remote_exprs = lappend(remote_exprs, rinfo->clause);
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			if (rinfo->pseudoconstant)
+				continue;
+
+			/* 
+			 * Check if this clause is in our join clauses or remote_conds.
+			 * If not, it's a local condition.
+			 */
+			if (list_member_ptr(fpinfo->joinclauses, rinfo) ||
+				list_member_ptr(fpinfo->remote_conds, rinfo))
+			{
+				remote_exprs = lappend(remote_exprs, rinfo->clause);
+			}
+			else
+			{
+				local_exprs = lappend(local_exprs, rinfo->clause);
+			}
 		}
-		else if (list_member_ptr(fpinfo->local_conds, rinfo))
-			local_exprs = lappend(local_exprs, rinfo->clause);
-		else if (is_foreign_expr(root, baserel, rinfo->clause))
-		{
-			remote_conds = lappend(remote_conds, rinfo);
-			remote_exprs = lappend(remote_exprs, rinfo->clause);
-		}
-		else
-			local_exprs = lappend(local_exprs, rinfo->clause);
+		
+		/*
+		 * Build the list of Vars we need to fetch from the remote server.
+		 * This extracts all Vars from the join relation's target expressions,
+		 * join conditions, and remote conditions.
+		 */
+		tlist_to_deparse = build_tlist_to_deparse(baserel);
+		
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: Built tlist_to_deparse with %d columns",
+					list_length(tlist_to_deparse))
+			));
+		
+		/*
+		 * Build the SELECT query for the join relation using the Var list.
+		 */
+		initStringInfo(&sql);
+		deparseSelectSqlForJoin(&sql, root, baserel, tlist_to_deparse, &retrieved_attrs, &option_set);
+		
+		option_set.query = sql.data;
+		
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: JOIN query: %s", option_set.query)
+			));
+		
+		/*
+		 * The fdw_scan_tlist tells PostgreSQL what columns the foreign scan
+		 * will return. For join relations, this is the list of Vars we're
+		 * fetching from the remote - the same list we used for deparsing.
+		 * This allows the executor to know how to map remote results.
+		 */
+		fdw_scan_tlist = tlist_to_deparse;
 	}
+	else
+#endif
+	{
+		/* Base relation (single foreign table) */
+		scan_relid = baserel->relid;
+		
+		tdsGetForeignTableOptionsFromCatalog(foreigntableid, &option_set);
+		
+		/*
+		 * Separate the scan_clauses into those that can be executed remotely and
+		 * those that can't.  baserestrictinfo clauses that were previously
+		 * determined to be safe or unsafe by classifyConditions are shown in
+		 * fpinfo->remote_conds and fpinfo->local_conds.  Anything else in the
+		 * scan_clauses list will be a join clause, which we have to check for
+		 * remote-safety.
+		 *
+		 * Note: the join clauses we see here should be the exact same ones
+		 * previously examined by postgresGetForeignPaths.  Possibly it'd be worth
+		 * passing forward the classification work done then, rather than
+		 * repeating it here.
+		 *
+		 * This code must match "extract_actual_clauses(scan_clauses, false)"
+		 * except for the additional decision about remote versus local execution.
+		 * Note however that we don't strip the RestrictInfo nodes from the
+		 * remote_conds list, since appendWhereClause expects a list of
+		 * RestrictInfos.
+		 */
+		foreach(lc, scan_clauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-	/*
-	 * Build the query string to be sent for execution, and identify
-	 * expressions to be sent as parameters.
-	 */
-	 
-	tdsBuildForeignQuery(root, baserel, &option_set, 
-		fpinfo->attrs_used, &retrieved_attrs, 
-		remote_conds, NULL, best_path->path.pathkeys);
+			Assert(IsA(rinfo, RestrictInfo));
+
+			/* Ignore any pseudoconstants, they're dealt with elsewhere */
+			if (rinfo->pseudoconstant)
+				continue;
+
+			if (list_member_ptr(fpinfo->remote_conds, rinfo))
+			{
+				remote_conds = lappend(remote_conds, rinfo);
+				remote_exprs = lappend(remote_exprs, rinfo->clause);
+			}
+			else if (list_member_ptr(fpinfo->local_conds, rinfo))
+				local_exprs = lappend(local_exprs, rinfo->clause);
+			else if (is_foreign_expr(root, baserel, rinfo->clause))
+			{
+				remote_conds = lappend(remote_conds, rinfo);
+				remote_exprs = lappend(remote_exprs, rinfo->clause);
+			}
+			else
+				local_exprs = lappend(local_exprs, rinfo->clause);
+		}
+
+		/*
+		 * Build the query string to be sent for execution, and identify
+		 * expressions to be sent as parameters.
+		 */
+		 
+		tdsBuildForeignQuery(root, baserel, &option_set, 
+			fpinfo->attrs_used, &retrieved_attrs, 
+			remote_conds, NULL, best_path->path.pathkeys);
+	}
 
 	/*
 	 * Build the fdw_private list that will be available to the executor.
 	 * Items in the list must match enum FdwScanPrivateIndex, above.
 	 */
-	fdw_private = list_make2(makeString(option_set.query),
-							 retrieved_attrs);
+	fdw_private = list_make3(makeString(option_set.query),
+							 retrieved_attrs,
+							 makeInteger(is_join_rel ? fpinfo->serverid : 0));
 
 	/*
 	 * Create the ForeignScan node from target list, filtering expressions,
@@ -3095,7 +3737,7 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 							scan_relid,
 							params_list,
 							fdw_private,
-							NIL,	/* no custom tlist */
+							is_join_rel ? fdw_scan_tlist : NIL,
 							remote_exprs,
 							outer_plan);
 	#else

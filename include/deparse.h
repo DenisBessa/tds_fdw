@@ -154,5 +154,42 @@ appendWhereClause(StringInfo buf,
 void
 appendOrderByClause(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
 					List *pathkeys);
+
+/*
+ * JOIN pushdown support functions (PostgreSQL 9.5+)
+ */
+#if (PG_VERSION_NUM >= 90500)
+
+/*
+ * Build a target list of Vars to fetch from the remote server for a join.
+ * This extracts all needed Vars from the join relation's expressions.
+ */
+List *
+build_tlist_to_deparse(RelOptInfo *joinrel);
+
+/*
+ * Deparse the FROM clause for a join relation, generating proper
+ * JOIN ... ON syntax.
+ */
+void
+deparseFromExprForJoin(StringInfo buf, PlannerInfo *root, RelOptInfo *joinrel,
+					   bool use_alias, Index *rtindex);
+
+/*
+ * Construct a SELECT statement for a join relation.
+ * This generates the complete query with proper JOIN syntax.
+ * tlist_to_deparse should be the result of build_tlist_to_deparse().
+ */
+void
+deparseSelectSqlForJoin(StringInfo buf, PlannerInfo *root, RelOptInfo *joinrel,
+						List *tlist_to_deparse, List **retrieved_attrs, TdsFdwOptionSet *option_set);
+
+/*
+ * Deparse a column reference with table alias for JOIN queries.
+ */
+void
+deparseColumnRefForJoin(StringInfo buf, int varno, int varattno, PlannerInfo *root);
+
+#endif /* PG_VERSION_NUM >= 90500 */
 					
 #endif
