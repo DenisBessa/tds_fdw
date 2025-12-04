@@ -8,5 +8,7 @@ FROM
     foempregados e
     INNER JOIN focargos c ON c."i_cargos" = e."i_cargos"
         AND c."codi_emp" = e."codi_emp"
+WHERE
+    e."codi_emp" = 5600
 LIMIT 10;
 

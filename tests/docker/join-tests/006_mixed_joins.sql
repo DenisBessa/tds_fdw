@@ -11,5 +11,7 @@ FROM
         AND c."codi_emp" = e."codi_emp"
     LEFT JOIN fodepto d ON d."i_depto" = e."i_depto"
         AND d."codi_emp" = e."codi_emp"
+WHERE
+    e."codi_emp" = 5600
 LIMIT 10;
 
