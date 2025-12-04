@@ -1,0 +1,12 @@
+{
+    "test_desc": "JOIN with WHERE on second (joined) table",
+    "expect_pushdown": true,
+    "notes": "Simplified test case - WHERE references focargos (the joined table) instead of foempregados (the base table)",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  tds_fdw_test:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.test
+    container_name: tds_fdw_test
+    env_file:
+      - ../../.env
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+      PGDATA: /var/lib/postgresql/data
+      # Sybase connection info (with defaults)
+      SYBASE_HOST: ${SYBASE_HOST:-host.docker.internal}
+      SYBASE_PORT: ${SYBASE_PORT:-5000}
+      SYBASE_USER: ${SYBASE_USER:-sa}
+      SYBASE_PASSWORD: ${SYBASE_PASSWORD:-myPassword}
+      SYBASE_DATABASE: ${SYBASE_DATABASE:-master}
+      SYBASE_SCHEMA: ${SYBASE_SCHEMA:-dbo}
+      TEST_NAME: ${TEST_NAME:-all}
+      DEBUG_MODE: ${DEBUG_MODE:-0}
+    ports:
+      - "5433:5432"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+

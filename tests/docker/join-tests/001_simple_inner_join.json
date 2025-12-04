@@ -1,0 +1,11 @@
+{
+    "test_desc": "Simple INNER JOIN between two tables",
+    "expect_pushdown": true,
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

@@ -1,0 +1,11 @@
+{
+    "test_desc": "Setup - Import foreign tables for JOIN testing",
+    "expect_pushdown": false,
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

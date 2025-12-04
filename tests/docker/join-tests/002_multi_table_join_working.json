@@ -1,0 +1,12 @@
+{
+    "test_desc": "Multi-table JOIN with WHERE on primary table (working case)",
+    "expect_pushdown": true,
+    "notes": "This query works because WHERE clause references foempregados which is the first table in FROM",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

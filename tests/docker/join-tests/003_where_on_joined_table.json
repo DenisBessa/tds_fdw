@@ -1,0 +1,13 @@
+{
+    "test_desc": "Multi-table JOIN with WHERE on joined table (failing case)",
+    "expect_pushdown": true,
+    "notes": "This query FAILS because WHERE clause references geempre which is joined later, not the first table (fovcheque). The JOIN pushdown code may not handle remote_conds properly when Vars reference tables other than the base table.",
+    "known_issue": true,
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

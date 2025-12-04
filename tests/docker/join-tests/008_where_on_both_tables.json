@@ -1,0 +1,12 @@
+{
+    "test_desc": "JOIN with WHERE conditions on both tables",
+    "expect_pushdown": true,
+    "notes": "Tests WHERE conditions that reference columns from both the base and joined tables",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

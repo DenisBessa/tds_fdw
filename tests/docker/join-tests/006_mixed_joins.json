@@ -1,0 +1,11 @@
+{
+    "test_desc": "Mixed INNER and LEFT JOIN",
+    "expect_pushdown": true,
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

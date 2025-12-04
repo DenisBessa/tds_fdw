@@ -1,0 +1,12 @@
+{
+    "test_desc": "Three table JOIN",
+    "expect_pushdown": true,
+    "notes": "Tests JOIN pushdown with three tables",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

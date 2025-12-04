@@ -1,0 +1,47 @@
+FROM postgres:16
+
+# Install dependencies (gosu is already in postgres:16 image)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    postgresql-server-dev-16 \
+    freetds-dev \
+    freetds-bin \
+    python3 \
+    git \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy tds_fdw source
+COPY . /tmp/tds_fdw
+
+WORKDIR /tmp/tds_fdw
+
+# Build and install tds_fdw
+RUN make USE_PGXS=1 clean && \
+    make USE_PGXS=1 && \
+    make USE_PGXS=1 install
+
+# Copy test files
+RUN mkdir -p /tests/join-tests
+COPY tests/docker/join-tests/ /tests/join-tests/
+COPY tests/docker/run-join-test.sh /usr/local/bin/run-join-test.sh
+RUN chmod +x /usr/local/bin/run-join-test.sh
+
+# Cleanup source
+RUN rm -rf /tmp/tds_fdw
+
+WORKDIR /
+
+# Set default environment variables
+ENV POSTGRES_USER=postgres
+ENV POSTGRES_PASSWORD=postgres
+ENV POSTGRES_DB=testdb
+ENV PGDATA=/var/lib/postgresql/data
+ENV SYBASE_PORT=5000
+ENV TEST_NAME=all
+
+# Entry point script that initializes PostgreSQL and runs tests
+COPY tests/docker/entrypoint-test.sh /usr/local/bin/entrypoint-test.sh
+RUN chmod +x /usr/local/bin/entrypoint-test.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-test.sh"]

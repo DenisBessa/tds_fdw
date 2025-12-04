@@ -3587,30 +3587,92 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 		tdsGetForeignServerOptionsFromCatalog(fpinfo->serverid, &option_set);
 		
 		/*
-		 * For join relations, extract local conditions from scan_clauses.
-		 * Remote conditions were already classified during GetForeignJoinPaths.
+		 * For join relations, we need to combine:
+		 * 1. Existing remote_conds from component relations (propagated during join planning)
+		 * 2. Any new conditions from scan_clauses that can be pushed down
+		 * 
+		 * Note: scan_clauses may be empty if the planner has already pushed all
+		 * conditions into the component relations.
 		 */
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: Processing %d scan_clauses for JOIN, joinclauses=%d, existing remote_conds=%d",
+					list_length(scan_clauses), 
+					list_length(fpinfo->joinclauses),
+					list_length(fpinfo->remote_conds))
+			));
+		
+		/*
+		 * Start with existing remote_conds from join planning.
+		 * These were propagated from the component relations.
+		 * We need to add both the RestrictInfos to remote_conds AND
+		 * their clauses to remote_exprs for consistency with the non-join case.
+		 */
+		foreach(lc, fpinfo->remote_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			remote_conds = lappend(remote_conds, rinfo);
+			remote_exprs = lappend(remote_exprs, rinfo->clause);
+		}
+		
+		/* Add any new conditions from scan_clauses */
 		foreach(lc, scan_clauses)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
 			if (rinfo->pseudoconstant)
+			{
+				ereport(DEBUG3,
+					(errmsg("tds_fdw: Skipping pseudoconstant clause")
+					));
 				continue;
+			}
 
 			/* 
-			 * Check if this clause is in our join clauses or remote_conds.
-			 * If not, it's a local condition.
+			 * Check if this clause is already in our lists.
+			 * Skip if already present to avoid duplicates.
 			 */
 			if (list_member_ptr(fpinfo->joinclauses, rinfo) ||
-				list_member_ptr(fpinfo->remote_conds, rinfo))
+				list_member_ptr(remote_conds, rinfo))
 			{
+				ereport(DEBUG3,
+					(errmsg("tds_fdw: Clause already in joinclauses or remote_conds - skipping")
+					));
+				continue;
+			}
+			
+			/*
+			 * Check if the clause can be executed remotely.
+			 * This handles WHERE clauses that reference columns from any table in the join.
+			 */
+			if (is_foreign_expr(root, baserel, rinfo->clause))
+			{
+				remote_conds = lappend(remote_conds, rinfo);
 				remote_exprs = lappend(remote_exprs, rinfo->clause);
+				
+				ereport(DEBUG3,
+					(errmsg("tds_fdw: Additional WHERE clause can be pushed down to join")
+					));
 			}
 			else
 			{
 				local_exprs = lappend(local_exprs, rinfo->clause);
+				
+				ereport(DEBUG3,
+					(errmsg("tds_fdw: WHERE clause must be evaluated locally")
+					));
 			}
 		}
+		
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: After classification: remote_conds=%d, local_exprs=%d",
+					list_length(remote_conds), list_length(local_exprs))
+			));
+		
+		/*
+		 * Update fpinfo->remote_conds with the complete list of remote conditions.
+		 * This is used by deparseSelectSqlForJoin to generate the WHERE clause.
+		 */
+		fpinfo->remote_conds = remote_conds;
 		
 		/*
 		 * Build the list of Vars we need to fetch from the remote server.
