@@ -1,0 +1,12 @@
+{
+    "test_desc": "Join where table has no columns selected - only used for filtering via WHERE",
+    "expect_pushdown": true,
+    "notes": "Tests that a table joined only for filtering (no columns selected) is handled correctly. The WHERE condition should be propagated to filter the main table.",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

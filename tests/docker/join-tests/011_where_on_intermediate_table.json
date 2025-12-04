@@ -1,0 +1,12 @@
+{
+    "test_desc": "Four table JOIN with WHERE on intermediate table (not the first or last table)",
+    "expect_pushdown": true,
+    "notes": "Tests that WHERE conditions on tables that are not the first in the FROM clause are correctly pushed down. This is a common pattern that can cause performance issues if not handled correctly.",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+

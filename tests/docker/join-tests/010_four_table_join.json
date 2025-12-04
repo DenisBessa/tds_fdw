@@ -1,0 +1,12 @@
+{
+    "test_desc": "Four table JOIN with multiple conditions - replicates real-world payroll query",
+    "expect_pushdown": true,
+    "notes": "Tests JOIN pushdown with four tables and WHERE condition on intermediate table. This is a common pattern in payroll systems.",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+
