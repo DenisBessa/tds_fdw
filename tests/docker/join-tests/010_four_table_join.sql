@@ -6,7 +6,7 @@ SELECT
     e."cpf",
     e."tipo_conta" AS account_type,
     b."i_bancos" AS bank_id,
-    v."competencia" AS date,
+    v."i_empregados" AS employee_id,
     g."codi_emp" AS company_id
 FROM
     fovcheque v

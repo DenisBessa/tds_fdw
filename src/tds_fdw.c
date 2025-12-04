@@ -3347,11 +3347,6 @@ tdsGetForeignJoinPaths(PlannerInfo *root,
 					tdsIsForeignRelation(root, outerrel),
 					tdsIsForeignRelation(root, innerrel))
 			));
-		#ifdef DEBUG
-			ereport(NOTICE,
-				(errmsg("tds_fdw: One or both relations are not TDS foreign tables")
-				));
-		#endif
 		return;
 	}
 	
@@ -3365,11 +3360,9 @@ tdsGetForeignJoinPaths(PlannerInfo *root,
 	if (serverid_o == InvalidOid || serverid_i == InvalidOid ||
 		serverid_o != serverid_i)
 	{
-		#ifdef DEBUG
-			ereport(NOTICE,
-				(errmsg("tds_fdw: Tables are on different servers, cannot push down join")
-				));
-		#endif
+		ereport(DEBUG3,
+			(errmsg("tds_fdw: Tables are on different servers, cannot push down join")
+			));
 		return;
 	}
 	
@@ -3589,12 +3582,6 @@ tdsGetForeignJoinPaths(PlannerInfo *root,
 		(errmsg("tds_fdw: JOIN path added - rows=%.0f, startup_cost=%.2f, total_cost=%.2f",
 				rows, startup_cost, total_cost)
 		));
-	
-	#ifdef DEBUG
-		ereport(NOTICE,
-			(errmsg("----> finishing tdsGetForeignJoinPaths (path added)")
-			));
-	#endif
 }
 
 #endif /* PG_VERSION_NUM >= 90500 */
@@ -5012,3 +4999,4 @@ int tds_hndlintr_func(void *vdbproc)
 	tds_clear_signals();
 	return INT_CANCEL;
 }
+

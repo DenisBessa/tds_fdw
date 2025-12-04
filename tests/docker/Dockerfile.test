@@ -6,10 +6,16 @@ RUN apt-get update && apt-get install -y \
     postgresql-server-dev-16 \
     freetds-dev \
     freetds-bin \
+    freetds-common \
+    libsybdb5 \
     python3 \
     git \
     gosu \
     && rm -rf /var/lib/apt/lists/*
+
+# Configure FreeTDS date format for Sybase compatibility
+RUN echo '[default]' > /etc/freetds/locales.conf && \
+    echo '        date format = %b %e %Y' >> /etc/freetds/locales.conf
 
 # Copy tds_fdw source
 COPY . /tmp/tds_fdw

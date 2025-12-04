@@ -1,0 +1,12 @@
+{
+    "test_desc": "Join with table that has no columns selected and WHERE on different table",
+    "expect_pushdown": true,
+    "notes": "This is the EXACT problem case: joining geempre but selecting no columns from it, with WHERE on fovcheque.codi_emp instead of geempre.codi_emp",
+    "server": {
+        "version": {
+            "min": "9.5.0",
+            "max": ""
+        }
+    }
+}
+
